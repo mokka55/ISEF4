@@ -1,0 +1,9 @@
+{
+  "name": "ParkSense - Multimodal Biomarker Research Platform",
+  "description": "ParkSense research platform for live speech acoustic analysis and computer-vision movement assessment using browser-based microphone and camera sensors.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
