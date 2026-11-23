@@ -10,6 +10,43 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
+// Deployed Random Forest speech model (Flask API on PythonAnywhere)
+const SPEECH_API_URL =
+  process.env.SPEECH_API_URL || 'https://wahdann.pythonanywhere.com/predict';
+
+/**
+ * Map the website's acoustic features to the 22 inputs of the trained model.
+ * The model was trained on the UCI Parkinson's voice dataset, where jitter and
+ * shimmer are stored as fractions (e.g. 0.0062), while the website reports
+ * them as percentages (x100) and jitter_abs in microseconds.
+ */
+function toModelFeatures(f: Record<string, number>): Record<string, number> {
+  return {
+    'MDVP:Fo(Hz)': f.f0_mean,
+    'MDVP:Fhi(Hz)': f.f0_max,
+    'MDVP:Flo(Hz)': f.f0_min,
+    'MDVP:Jitter(%)': f.jitter_local_pct / 100,
+    'MDVP:Jitter(Abs)': f.jitter_abs_us / 1e6,
+    'MDVP:RAP': f.jitter_rap / 100,
+    'MDVP:PPQ': f.jitter_ppq5 / 100,
+    'Jitter:DDP': f.jitter_ddp / 100,
+    'MDVP:Shimmer': f.shimmer_local_pct / 100,
+    'MDVP:Shimmer(dB)': f.shimmer_db,
+    'Shimmer:APQ3': f.shimmer_apq3 / 100,
+    'Shimmer:APQ5': f.shimmer_apq5 / 100,
+    'MDVP:APQ': f.shimmer_apq11 / 100,
+    'Shimmer:DDA': f.shimmer_dda / 100,
+    'NHR': f.nhr_ratio,
+    'HNR': f.hnr_db,
+    'RPDE': f.rpde,
+    'DFA': f.dfa,
+    'spread1': f.spread1,
+    'spread2': f.spread2,
+    'D2': f.d2_correlation,
+    'PPE': f.ppe,
+  };
+}
+
 // Configure multer for handling in-memory audio/video uploads
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -102,7 +139,7 @@ export interface AcousticFeatures44 {
  * FEATURE 1: POST /api/speech/analyze
  * Extracts 44 acoustic features and validates audio
  */
-app.post('/api/speech/analyze', upload.single('audio'), (req: Request, res: Response) => {
+app.post('/api/speech/analyze', upload.single('audio'), async (req: Request, res: Response) => {
   try {
     const file = req.file;
     const bodyFeatures = req.body.clientExtractedFeatures
@@ -180,20 +217,32 @@ app.post('/api/speech/analyze', upload.single('audio'), (req: Request, res: Resp
       normalizedFeatures[key] = parseFloat(Number(val).toFixed(4));
     }
 
-    // Oxford Acoustic Model Classification (Little et al. / Tsanas et al. Telemonitoring Benchmark)
-    // Standardized log-odds calculation from phonatory dysphonia weights:
-    const zJitter = ((features.jitter_local_pct || 0.48) - 0.48) / 0.35;
-    const zShimmer = ((features.shimmer_local_pct || 2.8) - 2.8) / 1.4;
-    const zHnr = (22.5 - (features.hnr_db || 22.5)) / 4.8;
-    const zPpe = ((features.ppe || 0.17) - 0.17) / 0.08;
-    const zRpde = ((features.rpde || 0.44) - 0.44) / 0.11;
-    const zSpread1 = ((features.spread1 || -5.6) - (-5.6)) / 1.1;
+    // Call the trained Random Forest model through the deployed API
+    const modelInput = toModelFeatures(features as unknown as Record<string, number>);
+    let apiData: { success?: boolean; prediction?: number; model_score?: number; error?: string };
+    try {
+      const apiRes = await fetch(SPEECH_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(modelInput),
+        signal: AbortSignal.timeout(30000),
+      });
+      apiData = await apiRes.json();
+      if (!apiRes.ok || typeof apiData.model_score !== 'number') {
+        throw new Error(apiData.error || `Model API responded with status ${apiRes.status}`);
+      }
+    } catch (apiErr) {
+      console.error('Speech model API error:', apiErr);
+      return res.status(502).json({
+        success: false,
+        error: 'The speech model service is unavailable right now. Please try again.',
+      });
+    }
 
-    const logitSpeech = -0.25 + 0.38 * zPpe + 0.32 * zJitter + 0.28 * zShimmer + 0.34 * zHnr + 0.22 * zRpde + 0.15 * zSpread1;
-    const rawPdProbSpeech = 1 / (1 + Math.exp(-logitSpeech));
-    const pdPatternProbSpeech = Math.max(8, Math.min(92, Math.round(rawPdProbSpeech * 100)));
+    const rawPdProbSpeech = apiData.model_score as number; // probability of class 1 (Parkinson's-related pattern)
+    const pdPatternProbSpeech = Math.round(rawPdProbSpeech * 100);
     const nonPdPatternProbSpeech = 100 - pdPatternProbSpeech;
-    const confidenceScoreSpeech = Math.max(12, Math.min(96, Math.round((Math.abs(pdPatternProbSpeech - 50) / 50) * 100)));
+    const confidenceScoreSpeech = Math.round((Math.abs(pdPatternProbSpeech - 50) / 50) * 100);
 
     // Extract key characteristics
     const detectedSpeechCharacteristics: string[] = [];
@@ -258,7 +307,7 @@ app.post('/api/speech/analyze', upload.single('audio'), (req: Request, res: Resp
     ];
 
     const speechExplanation =
-      `The Oxford Telemonitoring Acoustic Model evaluated 44 phonatory parameters. The analysis identified a ${pdPatternProbSpeech}% mathematical alignment with Parkinsonian phonatory patterns and a ${nonPdPatternProbSpeech}% alignment with non-Parkinsonian vocal stability. This metric reflects acoustic micro-perturbation similarity and does not constitute a clinical medical diagnosis.`;
+      `The ParkinSense Random Forest model evaluated 22 phonatory parameters. The analysis identified a ${pdPatternProbSpeech}% mathematical alignment with Parkinsonian phonatory patterns and a ${nonPdPatternProbSpeech}% alignment with non-Parkinsonian vocal stability. This metric reflects acoustic micro-perturbation similarity and does not constitute a clinical medical diagnosis.`;
 
     return res.json({
       success: true,
@@ -282,10 +331,10 @@ app.post('/api/speech/analyze', upload.single('audio'), (req: Request, res: Resp
       },
       extractedFeatures: features,
       prediction: {
-        modelName: 'Oxford Telemonitoring Acoustic Model (v1.4, Regularized Logistic Classifier)',
-        modelVersion: 'v1.4-Oxford-Ridge',
-        trainingCorpus: 'Oxford Parkinson\'s Telemonitoring Dataset (Little et al. 2008 / Tsanas et al. 2012; 5,875 biomedical voice trials)',
-        inferenceEngine: 'Standardized Z-Score Logit Classifier (44 Acoustic Dimensions)',
+        modelName: 'ParkinSense Speech Random Forest',
+        modelVersion: 'rf-uci-22',
+        trainingCorpus: 'UCI Parkinson\'s Voice Dataset',
+        inferenceEngine: 'Random Forest classifier (22 acoustic features)',
         pdPatternProbabilityPct: pdPatternProbSpeech,
         nonPdPatternProbabilityPct: nonPdPatternProbSpeech,
         confidenceScorePct: confidenceScoreSpeech,
